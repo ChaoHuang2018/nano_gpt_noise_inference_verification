@@ -24,8 +24,8 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-# import torch_npu 
-# from torch_npu.contrib import transfer_to_npu
+import torch_npu 
+from torch_npu.contrib import transfer_to_npu
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -37,7 +37,7 @@ from rich import print
 out_dir = 'out'
 eval_interval = 2000
 log_interval = 1
-eval_iters = 200
+eval_iters = 20
 eval_only = True # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
@@ -58,7 +58,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 10 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -72,7 +72,11 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'float32' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+
+# Set default dtype globally to float64 (CPU tensors will default to this)
+# torch.set_default_dtype(torch.float64)
+
 compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -111,7 +115,8 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+# ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+ctx = torch.cuda.amp.autocast(enabled=False)
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
@@ -195,7 +200,9 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+# scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+dtype = 'float32'
+scaler = torch.cuda.amp.GradScaler(enabled=False)
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -216,8 +223,10 @@ if ddp:
     
 model_cpu = GPT(gptconf).to("cpu")
 
-input_error_lower=-1e-3
-input_error_upper=1e-3
+# input_error_lower=-1e-7
+# input_error_upper=1e-7
+input_error_lower=0
+input_error_upper=0
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -237,17 +246,20 @@ def estimate_loss():
             # print(infos["x"][-1] <= infos["x_upper"][-1])           
             # print(infos['bounded'])
             # exit()
+            
             # cpu lower upper bound
             model_cpu.load_state_dict(model.state_dict())
             # model_cpu.to("cpu")
-            logits_cpu, loss_cpu, infos_cpu = model_cpu(X.to("cpu"), Y.to("cpu"), input_error_lower=input_error_lower, input_error_upper=input_error_upper, noising_input=False)
-            for layer_i in range(len(infos["x"])):
-                # print(infos["x"][layer_i].to("cpu") >= infos_cpu["x_lower"][layer_i])
-                # print(infos["x"][layer_i].to("cpu") <= infos_cpu["x_upper"][layer_i])
-                is_bounded = (infos["x"][layer_i].to("cpu") >= infos_cpu["x_lower"][layer_i]).all() and (infos["x"][layer_i].to("cpu") <= infos_cpu["x_upper"][layer_i]).all()
-                print(is_bounded)
-            # is_bounded = is_bounded.any()
-            exit()
+            for noise_number in range(1):
+                logits_cpu, loss_cpu, infos_cpu = model_cpu(X.to("cpu"), Y.to("cpu"), input_error_lower=input_error_lower, input_error_upper=input_error_upper, noising_input=False, noising_operator=True)
+                for layer_i in range(len(infos["x"])):
+                    # print(infos["x"][layer_i].to("cpu") >= infos_cpu["x_lower"][layer_i])
+                    # print(infos["x"][layer_i].to("cpu") <= infos_cpu["x_upper"][layer_i])
+                    is_bounded = (infos["x"][layer_i].to("cpu") >= infos_cpu["x_lower"][layer_i]).all() and (infos["x"][layer_i].to("cpu") <= infos_cpu["x_upper"][layer_i]).all()
+                    # print(str(k) + "-th input, " + str(noise_number) + "-th random noise, " + str(layer_i) + "-th layer, " + str(is_bounded))
+                    print(str(k) + "-th input, " + str(layer_i) + "-th layer, " + str(is_bounded))
+                # is_bounded = is_bounded.any()
+                # exit()
         out[split] = losses.mean()
     model.train()
     return out
@@ -312,31 +324,38 @@ while True:
     if iter_num == 0 and eval_only:
         break
 
-    # # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # # and using the GradScaler if data type is float16
-    # for micro_step in range(gradient_accumulation_steps):
-    #     if ddp:
-    #         # in DDP training we only need to sync gradients at the last micro step.
-    #         # the official way to do this is with model.no_sync() context manager, but
-    #         # I really dislike that this bloats the code and forces us to repeat code
-    #         # looking at the source of that context manager, it just toggles this variable
-    #         model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-    #     with ctx:
-    #         logits, loss, infos = model(X, Y)
-    #         loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
-    #     # immediately async prefetch next batch while model is doing the forward pass on the GPU
-    #     X, Y = get_batch('train')
-    #     # backward pass, with gradient scaling if training in fp16
-    #     scaler.scale(loss).backward()
-    # # clip the gradient
-    # if grad_clip != 0.0:
-    #     scaler.unscale_(optimizer)
-    #     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # # step the optimizer and scaler if training in fp16
-    # scaler.step(optimizer)
-    # scaler.update()
-    # # flush the gradients as soon as we can, no need for this memory anymore
-    # optimizer.zero_grad(set_to_none=True)
+    # forward backward update, with optional gradient accumulation to simulate larger batch size
+    # and using the GradScaler if data type is float16
+#     for micro_step in range(gradient_accumulation_steps):
+#         if ddp:
+#             # in DDP training we only need to sync gradients at the last micro step.
+#             # the official way to do this is with model.no_sync() context manager, but
+#             # I really dislike that this bloats the code and forces us to repeat code
+#             # looking at the source of that context manager, it just toggles this variable
+#             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+#         X, Y = get_batch('train')
+#         with ctx:
+#             logits, loss, infos = model(X, Y)
+#             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+#         # immediately async prefetch next batch while model is doing the forward pass on the GPU
+        
+#         # backward pass, with gradient scaling if training in fp16
+#         # scaler.scale(loss).backward()
+#         loss.backward()
+#         print(f"[Train step loss] {loss.item()}")
+#         # for name, param in model.named_parameters():
+#         #     if param.grad is not None:
+#         #         print(name, param.grad.abs().mean())
+#     # clip the gradient
+#     if grad_clip != 0.0:
+#         # scaler.unscale_(optimizer)
+#         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+#     # step the optimizer and scaler if training in fp16
+#     # scaler.step(optimizer)
+#     # scaler.update()
+#     optimizer.step()
+#     # flush the gradients as soon as we can, no need for this memory anymore
+#     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
     t1 = time.time()
@@ -352,6 +371,10 @@ while True:
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
+    
+    # print("iter_num: " + str(iter_num))
+    # print("max_iters: " + str(max_iters))
+    
 
     # termination conditions
     if iter_num > max_iters:

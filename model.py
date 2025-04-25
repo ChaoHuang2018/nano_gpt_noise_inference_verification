@@ -27,7 +27,7 @@ class LayerNorm(nn.Module):
         self.bias_positive = nn.Parameter(torch.zeros(ndim)) if bias else None
         self.bias_negative = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-    def forward(self, input, input_lower=None, input_upper=None):
+    def forward(self, input, input_lower=None, input_upper=None, operator_noise=0):
         with torch.no_grad():
             eps=1e-5
             if input_lower == None:
@@ -37,18 +37,18 @@ class LayerNorm(nn.Module):
 
             # step 1: Propagation of the Mean
             input_mean = input.mean(dim=(-2, -1), keepdim=True)
-            input_lower_mean = input_lower.mean(dim=(-2, -1), keepdim=True) # m_a
-            input_upper_mean = input_upper.mean(dim=(-2, -1), keepdim=True) # m_b
+            input_lower_mean = input_lower.mean(dim=(-2, -1), keepdim=True) - operator_noise # m_a
+            input_upper_mean = input_upper.mean(dim=(-2, -1), keepdim=True) + operator_noise # m_b
 
             # step 2: Propagation of the Centered Differences
             input_centered_diff = input - input_mean
-            input_lower_centered_diff = input_lower - input_lower_mean # d_a
-            input_upper_centered_diff = input_upper - input_upper_mean # d_b
+            input_lower_centered_diff = input_lower - input_lower_mean - operator_noise# d_a
+            input_upper_centered_diff = input_upper - input_upper_mean + operator_noise# d_b
 
             # step 3: Propagation of the Squared Differences (Variance)
             input_variance = input.var(dim=(-2, -1), keepdim=True, unbiased=False)
-            input_lower_variance = input_lower.var(dim=(-2, -1), keepdim=True, unbiased=False) # v_a
-            input_upper_variance = input_upper.var(dim=(-2, -1), keepdim=True, unbiased=False) # v_b
+            input_lower_variance = input_lower.var(dim=(-2, -1), keepdim=True, unbiased=False) - operator_noise # v_a
+            input_upper_variance = input_upper.var(dim=(-2, -1), keepdim=True, unbiased=False) + operator_noise # v_b
 
             # step 4: ropagation of the Division
             input_division = torch.sqrt(input_variance + eps)
@@ -61,8 +61,8 @@ class LayerNorm(nn.Module):
                 (input_upper_centered_diff / input_lower_division).unsqueeze(0),
                 (input_upper_centered_diff / input_upper_division).unsqueeze(0),
             ], dim=0)
-            input_lower_normalized = input_lower_upper_normalized.min(dim=0)[0]
-            input_upper_normalized = input_lower_upper_normalized.max(dim=0)[0]
+            input_lower_normalized = input_lower_upper_normalized.min(dim=0)[0] - operator_noise
+            input_upper_normalized = input_lower_upper_normalized.max(dim=0)[0] + operator_noise
 
 
             # step 5: Scaling and Shifting
@@ -77,10 +77,10 @@ class LayerNorm(nn.Module):
             self.weight_positive[mask_negative] = 0
 
             output_normalized_lower = input_lower_normalized * self.weight_positive
-            output_normalized_lower += input_upper_normalized * self.weight_negative
+            output_normalized_lower += input_upper_normalized * self.weight_negative - operator_noise
 
             output_normalized_upper = input_upper_normalized * self.weight_positive
-            output_normalized_upper += input_lower_normalized * self.weight_negative
+            output_normalized_upper += input_lower_normalized * self.weight_negative + operator_noise
 
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5), output_normalized_lower, output_normalized_upper
 
@@ -109,7 +109,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, x_lower=None, x_upper=None):
+    def forward(self, x, x_lower=None, x_upper=None, operator_noise=0):
         if x_lower is None:
             x_lower = x.clone()
         if x_upper is None:
@@ -137,27 +137,27 @@ class CausalSelfAttention(nn.Module):
             q_lower_negative, k_lower_negative, v_lower_negative  = self.c_attn_negative(x_lower).split(self.n_embd, dim=2)
             q_lower_positive, k_lower_positive, v_lower_positive  = self.c_attn_positive(x_lower).split(self.n_embd, dim=2)
 
-            q_lower = q_lower_positive + q_upper_negative
-            q_upper = q_upper_positive + q_lower_negative
+            q_lower = q_lower_positive + q_upper_negative - operator_noise
+            q_upper = q_upper_positive + q_lower_negative + operator_noise
 
-            k_lower = k_lower_positive + k_upper_negative
-            k_upper = k_upper_positive + k_lower_negative
+            k_lower = k_lower_positive + k_upper_negative - operator_noise
+            k_upper = k_upper_positive + k_lower_negative + operator_noise
 
-            v_lower = v_lower_positive + v_upper_negative
-            v_upper = v_upper_positive + v_lower_negative
+            v_lower = v_lower_positive + v_upper_negative - operator_noise
+            v_upper = v_upper_positive + v_lower_negative + operator_noise
 
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         with torch.no_grad():            
-            k_lower = k_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q_lower = q_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v_lower = v_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            k_lower = k_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) - operator_noise # (B, nh, T, hs)
+            q_lower = q_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) - operator_noise # (B, nh, T, hs)
+            v_lower = v_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) - operator_noise # (B, nh, T, hs)
 
-            k_upper = k_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            q_upper = q_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-            v_upper = v_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+            k_upper = k_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) + operator_noise # (B, nh, T, hs)
+            q_upper = q_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) + operator_noise # (B, nh, T, hs)
+            v_upper = v_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) + operator_noise # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -185,8 +185,8 @@ class CausalSelfAttention(nn.Module):
                     y_q_upper_k_upper_v_upper.unsqueeze(0),
                 ], dim=0)
 
-                y_lower = y_all.min(dim=0)[0]
-                y_upper = y_all.max(dim=0)[0]
+                y_lower = y_all.min(dim=0)[0] - operator_noise
+                y_upper = y_all.max(dim=0)[0] + operator_noise
 
         else:
             # manual implementation of attention
@@ -233,8 +233,8 @@ class CausalSelfAttention(nn.Module):
                     y_upper_lower.unsqueeze(0), 
                     y_upper_upper.unsqueeze(0), 
                 ], dim=0)
-                y_lower = y_all.min(dim=0)[0]
-                y_upper = y_all.max(dim=0)[0]
+                y_lower = y_all.min(dim=0)[0] - operator_noise
+                y_upper = y_all.max(dim=0)[0] + operator_noise
 
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         with torch.no_grad():
@@ -244,8 +244,8 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         with torch.no_grad():
-            y_lower = self.resid_dropout(self.c_proj(y_lower))
-            y_upper = self.resid_dropout(self.c_proj(y_upper))
+            y_lower = self.resid_dropout(self.c_proj(y_lower)) - operator_noise
+            y_upper = self.resid_dropout(self.c_proj(y_upper)) + operator_noise
         return y, y_lower, y_upper
 
 class MLP(nn.Module):
@@ -263,7 +263,7 @@ class MLP(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, x_lower=None, x_upper=None): 
+    def forward(self, x, x_lower=None, x_upper=None, operator_noise=0): 
         if x_lower is None:
             x_lower = x.clone()
         if x_upper is None:
@@ -286,13 +286,13 @@ class MLP(nn.Module):
             x_upper_negative = self.c_fc_negative(x_upper)
             x_upper_positive = self.c_fc_positive(x_upper)
 
-            x_lower = x_lower_positive + x_upper_negative
-            x_upper = x_upper_positive + x_lower_negative
+            x_lower = x_lower_positive + x_upper_negative - operator_noise
+            x_upper = x_upper_positive + x_lower_negative + operator_noise
 
         x = self.gelu(x)
         with torch.no_grad():
-            x_lower = self.gelu(x_lower)
-            x_upper = self.gelu(x_upper)
+            x_lower = self.gelu(x_lower) - operator_noise
+            x_upper = self.gelu(x_upper) + operator_noise
             
             mask_negative = self.c_proj.weight.data >= 0
             mask_positive = self.c_proj.weight.data < 0
@@ -310,13 +310,13 @@ class MLP(nn.Module):
             x_upper_negative = self.c_proj_negative(x_upper)
             x_upper_positive = self.c_proj_positive(x_upper)
 
-            x_lower = x_lower_positive + x_upper_negative
-            x_upper = x_upper_positive + x_lower_negative
+            x_lower = x_lower_positive + x_upper_negative - operator_noise
+            x_upper = x_upper_positive + x_lower_negative + operator_noise
 
         x = self.dropout(x)
         with torch.no_grad():
-            x_lower = self.dropout(x_lower)
-            x_upper = self.dropout(x_upper)
+            x_lower = self.dropout(x_lower) - operator_noise
+            x_upper = self.dropout(x_upper) + operator_noise
 
         return x, x_lower, x_upper
 
@@ -329,17 +329,17 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, x_lower=None, x_upper=None):
+    def forward(self, x, x_lower=None, x_upper=None, operator_noise=0):
 
-        x, x_lower, x_upper = self.ln_1(x, x_lower, x_upper)
-        attn_x, attn_x_lower, attn_x_upper = self.attn(x, x_lower, x_upper)
+        x, x_lower, x_upper = self.ln_1(x, x_lower, x_upper, operator_noise)
+        attn_x, attn_x_lower, attn_x_upper = self.attn(x, x_lower, x_upper, operator_noise)
         x = x + attn_x
         with torch.no_grad():
             x_lower = x_lower + attn_x_lower
             x_upper = x_upper + attn_x_upper
 
-        x, x_lower, x_upper = self.ln_2(x, x_lower, x_upper)
-        mlp_x, mlp_x_lower, mlp_x_upper = self.mlp(x, x_lower, x_upper)
+        x, x_lower, x_upper = self.ln_2(x, x_lower, x_upper, operator_noise)
+        mlp_x, mlp_x_lower, mlp_x_upper = self.mlp(x, x_lower, x_upper, operator_noise)
         x = x + mlp_x
         with torch.no_grad():
             x_lower = x_lower + mlp_x_lower
@@ -408,7 +408,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, input_error_lower=-1e-3, input_error_upper=1e-3, noising_input=False):
+    def forward(self, idx, targets=None, input_error_lower=-1e-3, input_error_upper=1e-3, noising_input=False, noising_operator=False):
         infos = {
             'x': [],
             'x_lower': [],
@@ -426,6 +426,9 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         if noising_input:
             x = x + (torch.rand_like(x).to(device) * (input_error_upper - input_error_lower) + input_error_lower)
+        operator_noise = 0
+        if noising_operator:
+            operator_noise = 1e-7
         with torch.no_grad():
             x_lower = x + input_error_lower
             x_upper = x + input_error_upper
@@ -435,7 +438,7 @@ class GPT(nn.Module):
         # infos['bounded'] *= (((x >= x_lower) * (x <= x_upper)).sum() == x.view(-1).shape[0])
 
         for block in self.transformer.h:
-            x, x_lower, x_upper = block(x, x_lower, x_upper)
+            x, x_lower, x_upper = block(x, x_lower, x_upper, operator_noise)
             infos['x'].append(x)
             infos['x_lower'].append(x_lower)
             infos['x_upper'].append(x_upper)
@@ -443,7 +446,7 @@ class GPT(nn.Module):
             # infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
             # infos['bounded'].append((x >= x_lower).all() and (x <= x_upper).all())
 
-        x, x_lower, x_upper = self.transformer.ln_f(x, x_lower, x_upper)
+        x, x_lower, x_upper = self.transformer.ln_f(x, x_lower, x_upper, operator_noise)
 
         infos['x'].append(x)
         infos['x_lower'].append(x_lower)
@@ -553,7 +556,8 @@ class GPT(nn.Module):
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
+        # use_fused = fused_available and device_type == 'cuda'
+        use_fused = False
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
