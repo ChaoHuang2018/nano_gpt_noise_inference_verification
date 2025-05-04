@@ -1,0 +1,23 @@
+IBP Error Report (Multiple Samples)
+============================================================
+Layer Type     : LayerNorm
+  Total Count  : 832
+  Error Count  : 5
+  Error Rate   : 0.0060
+  Max Outside Error  : 4.768372e-07
+  True CPU/GPU Error : 9.536743e-07
+  Location (Sample #63, Layer #24)
+------------------------------------------------------------
+Layer Type     : SelfAttention
+  Total Count  : 384
+  Error Count  : 0
+  Error Rate   : 0.0000
+------------------------------------------------------------
+Layer Type     : MLP
+  Total Count  : 384
+  Error Count  : 384
+  Error Rate   : 1.0000
+  Max Outside Error  : 4.075468e-05
+  True CPU/GPU Error : 4.296750e-05
+  Location (Sample #55, Layer #3)
+------------------------------------------------------------

@@ -27,62 +27,215 @@ class LayerNorm(nn.Module):
         self.bias_positive = nn.Parameter(torch.zeros(ndim)) if bias else None
         self.bias_negative = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-    def forward(self, input, input_lower=None, input_upper=None, operator_noise=0):
+    def forward(self, input, input_error=None, operator_noise=0, infos_GPU=None, infos_CPU=None, layer_counter=None):
+        eps=1e-5
+        if input_error is None:
+            input_lower = input.clone()
+            input_upper = input.clone()
+        else:
+            input_lower = input - input_error
+            input_upper = input + input_error
+
+        if layer_counter is not None:
+            layer_info = {
+                'layer_num': layer_counter[0],
+                'layer_type': 'LayerNorm',
+                'x': input,
+                'x_lower': input_lower,
+                'x_upper': input_upper,
+                'y': None,
+                'y_lower': None,
+                'y_upper': None,
+            }
+        else:
+            layer_info = {}
+        
+        
+        def check_bounds(name, real_output, lower_bound, upper_bound):
+
+            real_minus_lower = lower_bound - real_output
+            real_minus_upper = real_output - upper_bound
+            real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+            real_outside = torch.clamp(real_outside, min=0.0)
+
+            bound_width = (upper_bound - lower_bound).max().item()
+
+            print(f"[{name}] Output outside interval max: {real_outside.max().item()}")
+            print(f"[{name}] Interval width max: {bound_width}")
+            
+            
         with torch.no_grad():
-            eps=1e-5
-            if input_lower == None:
-                input_lower = input.clone()
-            if input_upper == None:
-                input_upper = input.clone()
-
-            # step 1: Propagation of the Mean
+            # Step 1: 均值传播 (mean of input区间)
             input_mean = input.mean(dim=(-2, -1), keepdim=True)
-            input_lower_mean = input_lower.mean(dim=(-2, -1), keepdim=True) - operator_noise # m_a
-            input_upper_mean = input_upper.mean(dim=(-2, -1), keepdim=True) + operator_noise # m_b
 
-            # step 2: Propagation of the Centered Differences
+            mean_lower = input_lower.mean(dim=(-2, -1), keepdim=True) - operator_noise
+            mean_upper = input_upper.mean(dim=(-2, -1), keepdim=True) + operator_noise
+
+            # check_bounds("Step_1 - Mean:", input_mean, mean_lower, mean_upper)
+
+            # Step 2: (input - mean)区间传播
             input_centered_diff = input - input_mean
-            input_lower_centered_diff = input_lower - input_lower_mean - operator_noise# d_a
-            input_upper_centered_diff = input_upper - input_upper_mean + operator_noise# d_b
 
-            # step 3: Propagation of the Squared Differences (Variance)
-            input_variance = input.var(dim=(-2, -1), keepdim=True, unbiased=False)
-            input_lower_variance = input_lower.var(dim=(-2, -1), keepdim=True, unbiased=False) - operator_noise # v_a
-            input_upper_variance = input_upper.var(dim=(-2, -1), keepdim=True, unbiased=False) + operator_noise # v_b
+            x_lower_centered_min = input_lower - mean_upper 
+            x_upper_centered_max = input_upper - mean_lower 
 
-            # step 4: ropagation of the Division
+            centered_min = x_lower_centered_min - operator_noise
+            centered_max = x_upper_centered_max + operator_noise
+
+            # print(input_centered_diff.dtype, centered_max.dtype)
+            # print(input_centered_diff.max() - centered_max.max())
+
+            # check_bounds("Step_2 - Centered Input:", input_centered_diff, centered_min, centered_max)
+
+            # Step 3: 方差传播
+            input_square = input_centered_diff ** 2
+            # Step 3.1: (x_i - mean)^2 区间传播                              
+            centered_min_sq = centered_min ** 2
+            centered_max_sq = centered_max ** 2
+
+            squared_lower = torch.where(
+                (centered_min <= 0) & (centered_max >= 0),
+                torch.zeros_like(centered_min),  # 跨0，最小值是0
+                torch.minimum(centered_min_sq, centered_max_sq)
+            ) 
+            squared_upper = torch.maximum(centered_min_sq, centered_max_sq) 
+
+            ##### 平方错误复现！
+#             error_mask = input_square > squared_upper
+#             if error_mask.any():
+#                 diff = (input_square - squared_upper)[error_mask]
+#                 abs_diff_all = diff.abs()
+#                 abs_diff_max = abs_diff_all.max().item()
+
+#                 print("[验证] 有平方误差超出边界！最大超出值: ", abs_diff_max)
+
+#                 # 获取 top-3 最大误差的索引（在 error_mask 压缩空间中的索引）
+#                 topk_vals, topk_indices = torch.topk(abs_diff_all, k=min(3, abs_diff_all.numel()))
+#                 offending_indices = torch.nonzero(error_mask, as_tuple=False)[topk_indices]
+
+#                 for idx in offending_indices:
+#                     idx = tuple(idx.tolist())
+#                     v_input = input_centered_diff[idx].item()
+#                     v_max = centered_max[idx].item()
+#                     v_min = centered_min[idx].item()
+#                     v_input_sq = input_square[idx].item()
+#                     v_max_sq = squared_upper[idx].item()
+#                     v_min_sq = squared_lower[idx].item()
+#                     print(f"  - 位置 {idx}: input = {v_input:.8f}, min = {v_min:.8f}, max = {v_max:.8f}, input² = {v_input_sq:.8f}, min² = {v_min_sq:.8f}, max² = {v_max_sq:.8f}, Δmin = {v_min_sq - v_min_sq:.8e}, Δmax = {v_input_sq - v_max_sq:.8e}")
+
+#                 if abs_diff_max > 1e-6:
+#                     print("❌ 超出误差容忍范围！终止程序。")
+#                     exit()
+#             else:
+#                 print("[验证] 所有平方值都在推导区间内 ✅")     
+            ##### 平方错误复现！
+
+
+            # check_bounds("Step_3.1 - Square:", input_square, squared_lower, squared_upper)
+
+            # Step 3.2: 取mean
+            input_variance = input_square.mean(dim=(-2, -1), keepdim=True)
+
+            var_lower = squared_lower.mean(dim=(-2, -1), keepdim=True) - operator_noise
+            var_upper = squared_upper.mean(dim=(-2, -1), keepdim=True) + operator_noise
+
+            # check_bounds("Step_3.2 - Mean square:", input_variance, var_lower, var_upper)
+
+            # Step 4: 归一化传播
+            # Step 4.1: 开平方传播
             input_division = torch.sqrt(input_variance + eps)
+
+
+            denom_lower = torch.sqrt(var_lower + eps)
+            denom_upper = torch.sqrt(var_upper + eps)
+
+            # check_bounds("Step_4.1 - Squared root:", input_division, denom_lower, denom_upper)
+
+            # Step 4.2: 归一化传播       
             input_normalized = input_centered_diff / input_division
-            input_lower_division = torch.sqrt(input_lower_variance + eps) # z_a
-            input_upper_division = torch.sqrt(input_upper_variance + eps) # z_b
-            input_lower_upper_normalized = torch.concat([
-                (input_lower_centered_diff / input_lower_division).unsqueeze(0),
-                (input_lower_centered_diff / input_upper_division).unsqueeze(0),
-                (input_upper_centered_diff / input_lower_division).unsqueeze(0),
-                (input_upper_centered_diff / input_upper_division).unsqueeze(0),
+
+            input_candidates = torch.stack([
+                (input_lower - mean_lower) / denom_lower,
+                (input_lower - mean_lower) / denom_upper,
+                (input_lower - mean_upper) / denom_lower,
+                (input_lower - mean_upper) / denom_upper,
+                (input_upper - mean_lower) / denom_lower,
+                (input_upper - mean_lower) / denom_upper,
+                (input_upper - mean_upper) / denom_lower,
+                (input_upper - mean_upper) / denom_upper,
             ], dim=0)
-            input_lower_normalized = input_lower_upper_normalized.min(dim=0)[0] - operator_noise
-            input_upper_normalized = input_lower_upper_normalized.max(dim=0)[0] + operator_noise
+
+            input_lower_norm = input_candidates.min(dim=0)[0] - operator_noise
+            input_upper_norm = input_candidates.max(dim=0)[0] + operator_noise
+
+            # check_bounds("Step_4.2 - Normalized:", input_normalized, input_lower_norm, input_upper_norm)
+
+            # Step 5: 仿射变换 (weight和bias)
+            weight = self.weight.to(input.device)
+            bias = self.bias.to(input.device) if self.bias is not None else torch.zeros_like(self.weight).to(input.device)
+
+            if bias is not None:
+                output_normalized = input_normalized * weight + bias
+            else:
+                output_normalized = input_normalized * weight    
+
+            # 必须区分正负weight                
+            weight_r = weight.view(1, 1, -1)
+            if bias is not None:
+                bias_r = bias.view(1, 1, -1)
+
+            mask_positive = (weight_r >= 0).float()
+            mask_negative = (weight_r < 0).float()
+
+            weight_positive = weight_r * mask_positive
+            weight_negative = weight_r * mask_negative
+
+            if bias is not None:
+                output_lower = input_lower_norm * weight_positive + input_upper_norm * weight_negative + bias_r - operator_noise
+                output_upper = input_upper_norm * weight_positive + input_lower_norm * weight_negative + bias_r + operator_noise
+            else:
+                output_lower = input_lower_norm * weight_positive + input_upper_norm * weight_negative - operator_noise
+                output_upper = input_upper_norm * weight_positive + input_lower_norm * weight_negative + operator_noise
+
+            # check_bounds("Step_5 - Affine:", output_normalized, output_lower, output_upper)
+
+            # --- 正常forward ---
+            x = F.layer_norm(input, self.weight.shape, weight, bias, eps)
+
+            # layer_info['y'] = x
+            # ！！！关键！使用内部F.layer_norm函数和我们的正则化实现不同，导致结果不一致，这里为了展示方法正确性，输出改为我们标准正则化输出
+            layer_info['y'] = output_normalized
+
+            layer_info['y_lower'] = output_lower
+            layer_info['y_upper'] = output_upper
+
+            if infos_GPU is not None and infos_CPU is None:
+                infos_GPU.append(layer_info)
+                print(f"Appending layer {layer_counter[0]} to infos_GPU, type = {layer_info['layer_type']}")
+                real_minus_lower = output_lower - output_normalized
+                real_minus_upper = output_normalized - output_upper
+                real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+                real_outside = torch.clamp(real_outside, min=0.0)  # 只保留超出的部分
+                print("Output range width: ", (output_upper - output_lower).max().item())
+                print("Real GPU output range error: ", real_outside.max().item())
+
+            if infos_CPU is not None:
+                infos_CPU.append(layer_info)
+                print(f"Appending layer {layer_counter[0]} to infos_CPU, type = {layer_info['layer_type']}")
+                # # 确保都在CPU上做比较
+                # output_normalized_cpu = output_normalized.detach().cpu()
+                # x_cpu = x.detach().cpu()
+                # diff = (output_normalized_cpu - x_cpu).abs().max().item()
+                # print(f"Manual norm vs. torch norm diff: {diff}")
 
 
-            # step 5: Scaling and Shifting
-            output_normalized = input_normalized * self.weight
-            mask_positive = self.weight >= 0
-            mask_negative = self.weight < 0
+            if layer_counter is not None:
+                layer_counter[0] += 1
 
-            self.weight_negative = self.weight
-            self.weight_negative[mask_positive] = 0
+            output_normalized_lower = output_lower
+            output_normalized_upper = output_upper
 
-            self.weight_positive = self.weight
-            self.weight_positive[mask_negative] = 0
-
-            output_normalized_lower = input_lower_normalized * self.weight_positive
-            output_normalized_lower += input_upper_normalized * self.weight_negative - operator_noise
-
-            output_normalized_upper = input_upper_normalized * self.weight_positive
-            output_normalized_upper += input_lower_normalized * self.weight_negative + operator_noise
-
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5), output_normalized_lower, output_normalized_upper
+        return x, output_normalized_lower, output_normalized_upper
 
 class CausalSelfAttention(nn.Module):
 
@@ -101,65 +254,116 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+        
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+            
 
-    def forward(self, x, x_lower=None, x_upper=None, operator_noise=0):
-        if x_lower is None:
+    def forward(self, x, x_error=None, operator_noise=0, infos_GPU=None, infos_CPU=None, layer_counter=None):
+        if x_error is None:
             x_lower = x.clone()
-        if x_upper is None:
             x_upper = x.clone()
+        else:
+            x_lower = x - x_error
+            x_upper = x + x_error
+        
+        if layer_counter is not None:
+            layer_info = {
+                'layer_num': layer_counter[0],
+                'layer_type': 'SelfAttention',
+                'x': x,
+                'x_lower': x_lower,
+                'x_upper': x_upper,
+                'y': None,
+                'y_lower': None,
+                'y_upper': None,
+            }
+        else:
+            layer_info = {}
+            
+        def check_bounds(name, real_output, lower_bound, upper_bound):
+            # 找出mask掉的位置（inf的位置）
+            invalid_mask = torch.isinf(lower_bound) | torch.isinf(upper_bound)
+
+            # 只在有效区域做比较
+            real_output_valid = real_output.masked_fill(invalid_mask, 0.0)
+            lower_bound_valid = lower_bound.masked_fill(invalid_mask, 0.0)
+            upper_bound_valid = upper_bound.masked_fill(invalid_mask, 0.0)
+
+            real_minus_lower = lower_bound_valid - real_output_valid
+            real_minus_upper = real_output_valid - upper_bound_valid
+            real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+            real_outside = torch.clamp(real_outside, min=0.0)
+
+            bound_width = (upper_bound_valid - lower_bound_valid).max().item()
+
+            print(f"[{name}] Output outside interval max: {real_outside.max().item()}")
+            print(f"[{name}] Interval width max: {bound_width}")
+        
+        # CPU模式下检查输入是否对齐
+        # if infos_CPU is not None:
+        #     print(f"Attention input diff: {(x.to('cpu') - infos_GPU[layer_counter[0]]['x'].to('cpu')).abs().max()}")
+            
+        
+        # 保证x_lower和x_upper和c_attn_positive的weight在同一个device
+        device_c_attn = self.c_attn.weight.device
+        if x.device != device_c_attn:
+            x = x.to(device_c_attn)
+        if x_lower.device != device_c_attn:
+            x_lower = x_lower.to(device_c_attn)
+        if x_upper.device != device_c_attn:
+            x_upper = x_upper.to(device_c_attn)
 
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+            
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # Step 1: Calculate Q K V and their interval bounds
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim           
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
 
         with torch.no_grad():
-            mask_positive = self.c_attn.weight.data >= 0
-            mask_negative = self.c_attn.weight.data < 0
-            c_attn_negative = self.c_attn.weight.data.clone()
-            c_attn_negative[mask_positive] = 0
-            self.c_attn_negative.weight = nn.Parameter(c_attn_negative)
-            c_attn_positive = self.c_attn.weight.data.clone()
-            c_attn_positive[mask_negative] = 0
-            self.c_attn_positive.weight = nn.Parameter(c_attn_positive)
+            W = self.c_attn.weight
+            W_pos = torch.clamp(W, min=0)
+            W_neg = torch.clamp(W, max=0)
+            
+            out_lower = x_lower @ W_pos.T + x_upper @ W_neg.T
+            out_upper = x_upper @ W_pos.T + x_lower @ W_neg.T
 
+            if self.c_attn.bias is not None:
+                out_lower += self.c_attn.bias
+                out_upper += self.c_attn.bias
+
+            q_lower, k_lower, v_lower = out_lower.split(self.n_embd, dim=2)
+            q_upper, k_upper, v_upper = out_upper.split(self.n_embd, dim=2)
+
+        # 正常 forward 输出 reshape
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        # 区间上下界 reshape
         with torch.no_grad():
-            q_upper_negative, k_upper_negative, v_upper_negative  = self.c_attn_negative(x_upper).split(self.n_embd, dim=2)
-            q_upper_positive, k_upper_positive, v_upper_positive  = self.c_attn_positive(x_upper).split(self.n_embd, dim=2)
+            k_lower = k_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) - operator_noise
+            q_lower = q_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) - operator_noise
+            v_lower = v_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) - operator_noise
+ 
+            k_upper = k_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) + operator_noise
+            q_upper = q_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) + operator_noise
+            v_upper = v_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) + operator_noise
 
-            q_lower_negative, k_lower_negative, v_lower_negative  = self.c_attn_negative(x_lower).split(self.n_embd, dim=2)
-            q_lower_positive, k_lower_positive, v_lower_positive  = self.c_attn_positive(x_lower).split(self.n_embd, dim=2)
-
-            q_lower = q_lower_positive + q_upper_negative - operator_noise
-            q_upper = q_upper_positive + q_lower_negative + operator_noise
-
-            k_lower = k_lower_positive + k_upper_negative - operator_noise
-            k_upper = k_upper_positive + k_lower_negative + operator_noise
-
-            v_lower = v_lower_positive + v_upper_negative - operator_noise
-            v_upper = v_upper_positive + v_lower_negative + operator_noise
-
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        with torch.no_grad():            
-            k_lower = k_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) - operator_noise # (B, nh, T, hs)
-            q_lower = q_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) - operator_noise # (B, nh, T, hs)
-            v_lower = v_lower.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) - operator_noise # (B, nh, T, hs)
-
-            k_upper = k_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) + operator_noise # (B, nh, T, hs)
-            q_upper = q_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) + operator_noise # (B, nh, T, hs)
-            v_upper = v_upper.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) + operator_noise # (B, nh, T, hs)
-
+            
+        
+        
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # 关闭self.flash保证GPU/CPU对齐
+        self.flash = False
+        
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
@@ -189,38 +393,142 @@ class CausalSelfAttention(nn.Module):
                 y_upper = y_all.max(dim=0)[0] + operator_noise
 
         else:
+            # Step 2:calculate of attention score and its interval bound
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            with torch.no_grad():
-                att_q_lower_k_lower = (q_lower @ k_lower.transpose(-2, -1)) * (1.0 / math.sqrt(k_lower.size(-1)))
-                att_q_lower_k_upper = (q_lower @ k_upper.transpose(-2, -1)) * (1.0 / math.sqrt(k_upper.size(-1)))
-                att_q_upper_k_lower = (q_upper @ k_lower.transpose(-2, -1)) * (1.0 / math.sqrt(k_lower.size(-1)))
-                att_q_upper_k_upper = (q_upper @ k_upper.transpose(-2, -1)) * (1.0 / math.sqrt(k_upper.size(-1)))
-                att_all = torch.concat([
-                    att_q_lower_k_lower.unsqueeze(0), 
-                    att_q_lower_k_upper.unsqueeze(0), 
-                    att_q_upper_k_lower.unsqueeze(0), 
-                    att_q_upper_k_upper.unsqueeze(0), 
-                ], dim=0)
 
-                att_lower = att_all.min(dim=0)[0]
-                att_upper = att_all.max(dim=0)[0]
+            with torch.no_grad():
+                # q_lower, q_upper: (B, nh, T, hs)
+                # k_lower, k_upper: (B, nh, T, hs)
+
+                chunk_size = 32  # 可以根据内存大小调整
+
+                B, nh, T, hs = q_lower.shape
+                att_lower = torch.zeros(B, nh, T, T, device=q_lower.device)
+                att_upper = torch.zeros(B, nh, T, T, device=q_lower.device)
+
+                # k方向一次性扩展，不分块
+                k_lower_expand = k_lower.unsqueeze(2)  # (B, nh, 1, T, hs)
+                k_upper_expand = k_upper.unsqueeze(2)
+
+                for start in range(0, T, chunk_size):
+                    end = min(start + chunk_size, T)
+
+                    # 只在q方向分块
+                    q_lower_chunk = q_lower[:, :, start:end, :].unsqueeze(3)  # (B, nh, chunk, 1, hs)
+                    q_upper_chunk = q_upper[:, :, start:end, :].unsqueeze(3)
+
+                    # 4种乘积组合 (注意这里k仍然是T，不切块)
+                    prod_ll = q_lower_chunk * k_lower_expand
+                    prod_lu = q_lower_chunk * k_upper_expand
+                    prod_ul = q_upper_chunk * k_lower_expand
+                    prod_uu = q_upper_chunk * k_upper_expand
+
+                    # 每一项的局部最小最大
+                    prod_min = torch.min(torch.min(prod_ll, prod_lu), torch.min(prod_ul, prod_uu))
+                    prod_max = torch.max(torch.max(prod_ll, prod_lu), torch.max(prod_ul, prod_uu))
+                    
+                    # 防止爆炸
+                    prod_min = torch.clamp(prod_min, min=-1e9, max=1e9)
+                    prod_max = torch.clamp(prod_max, min=-1e9, max=1e9)
+
+                    # sum over最后一个特征维度 hs
+                    # test
+                    # print(f"Before sum prod_min max: {prod_min.abs().max().item()}")
+                    # print(f"Before sum prod_max max: {prod_max.abs().max().item()}")
+                    
+                    chunk_att_lower = prod_min.sum(dim=-1) / math.sqrt(hs)  # (B, nh, chunk, T)
+                    chunk_att_upper = prod_max.sum(dim=-1) / math.sqrt(hs)
+                    
+                    # test
+                    # print(f"After sum chunk_att_lower any inf: {torch.isinf(chunk_att_lower).any()}")
+                    # print(f"After sum chunk_att_upper any inf: {torch.isinf(chunk_att_upper).any()}")
+
+                    # 正确写回原始 att_lower和att_upper
+                    att_lower[:, :, start:end, :] = chunk_att_lower - operator_noise
+                    att_upper[:, :, start:end, :] = chunk_att_upper + operator_noise
 
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             with torch.no_grad():
                 att_lower = att_lower.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
                 att_upper = att_upper.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             
-            att = F.softmax(att, dim=-1)
+            # att logits中心值算完
+            # check_bounds("Step2-AttentionLogits", att, att_lower, att_upper)
+            
+            # Step 3:calculate softmax and its interval bound
+            
             with torch.no_grad():
-                att_lower = F.softmax(att_lower, dim=-1)
-                att_upper = F.softmax(att_upper, dim=-1)
+                
+                B, nh, T, _ = att_lower.shape  # (B: batch, nh: num_heads, T: seq_len)
+
+                # === 1. 构造 logits x[i,j] 的上下界 ===
+                x = att
+                x_lower = att_lower
+                x_upper = att_upper
+
+                # check_bounds("Step3.1-Logits", x, x_lower, x_upper)
+
+                # # === 2. 修复 (-inf) - (-inf) 导致的 NaN ===
+                # invalid_mask = (x_lower == float('-inf')) & (x_upper == float('-inf'))
+                # x_lower = x_lower.masked_fill(invalid_mask, 0.0)
+                # x_upper = x_upper.masked_fill(invalid_mask, 0.0)
+
+                # === 3. 计算 exp(x[i,j]) 的上下界 ===
+                exp_x = torch.exp(x)
+
+                is_pos_inf = (x_lower == float('inf')) & (x_upper == float('inf'))
+                is_neg_inf = (x_lower == float('-inf')) & (x_upper == float('-inf'))
+                is_safe = ~(is_pos_inf | is_neg_inf)
+
+                exp_x_lower = torch.zeros_like(x_lower)
+                exp_x_upper = torch.zeros_like(x_upper)
+
+                exp_x_lower[is_safe] = torch.exp(x_lower[is_safe])
+                exp_x_upper[is_safe] = torch.exp(x_upper[is_safe])
+
+                exp_x_lower[is_pos_inf] = float('inf')
+                exp_x_upper[is_pos_inf] = float('inf')
+
+                exp_x_lower[is_neg_inf] = 0.0
+                exp_x_upper[is_neg_inf] = 0.0
+
+                # check_bounds("Step3.2-exp(x)", exp_x, exp_x_lower, exp_x_upper)
+
+                # === 4. 构造 softmax 分母上下界 ===
+                denom = exp_x.sum(dim=-1, keepdim=True)  # (B, nh, T, 1)
+                denom_lower = exp_x_lower.sum(dim=-1, keepdim=True)
+                denom_upper = exp_x_upper.sum(dim=-1, keepdim=True)
+
+                # check_bounds("Step3.3-Denominator", denom, denom_lower, denom_upper)
+
+                # === 5. 构造完整 softmax[i,j] 的上下界 ===
+                softmax = exp_x / denom
+                softmax_lower = exp_x_lower / denom_upper
+                softmax_upper = exp_x_upper / denom_lower
+
+                # check_bounds("Step3.4-Softmax", softmax, softmax_lower, softmax_upper)
+
+                # === 6. 手动 softmax 验证 ===
+                # softmax_manual = F.softmax(x, dim=-1)
+                # max_diff = (softmax_manual - softmax).abs().max().item()
+                # print("🧪 Max diff (manual vs. F.softmax):", max_diff)
+                    
+
+                # 最终得到 att_lower, att_upper 更新为 softmax后的上下界
+                att_lower = softmax_lower - operator_noise
+                att_upper = softmax_upper + operator_noise
+                
+            att = F.softmax(att, dim=-1)
 
             att = self.attn_dropout(att)
             with torch.no_grad():
                 att_lower = self.attn_dropout(att_lower)
                 att_upper = self.attn_dropout(att_upper)
+                
+            # check_bounds("Step3-AttentionWeights", att, att_lower, att_upper)
 
+            # Step 3:calculate context and its inerval bound
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
             with torch.no_grad():                
                 y_lower_lower = att_lower @ v_lower # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -241,11 +549,67 @@ class CausalSelfAttention(nn.Module):
             y_lower = y_lower.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
             y_upper = y_upper.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
-        # output projection
+        # check_bounds("Step4-Context", y, y_lower, y_upper)
+        
+        # Step 5: output projection and its interval bound
         y = self.resid_dropout(self.c_proj(y))
+        # eval模式下dropout为恒等映射，无须考虑误差
+        # 现在也要计算 y_lower, y_upper的变换
         with torch.no_grad():
-            y_lower = self.resid_dropout(self.c_proj(y_lower)) - operator_noise
-            y_upper = self.resid_dropout(self.c_proj(y_upper)) + operator_noise
+            weight = self.c_proj.weight
+            bias = self.c_proj.bias
+
+            mask_positive = (weight >= 0).float()
+            mask_negative = (weight < 0).float()
+
+            weight_positive = weight * mask_positive
+            weight_negative = weight * mask_negative
+
+            y_lower_proj = (y_lower @ weight_positive.t()) + (y_upper @ weight_negative.t())
+            y_upper_proj = (y_upper @ weight_positive.t()) + (y_lower @ weight_negative.t())
+
+            if bias is not None:
+                y_lower_proj += bias
+                y_upper_proj += bias
+
+            y_lower = y_lower_proj - operator_noise
+            y_upper = y_upper_proj + operator_noise
+            
+        # check_bounds("Step5-Project", y, y_lower, y_upper)
+            
+        # GPU/NPU模式下，只有输出值x有价值
+        x = y
+        x_lower = y_lower
+        x_upper = y_upper
+        layer_info['y'] = x
+        layer_info['y_lower'] = x_lower
+        layer_info['y_upper'] = x_upper
+
+        # GPU/NPU模式下，只有输出值y有价值
+        if infos_GPU is not None and infos_CPU is None:              
+            infos_GPU.append(layer_info)
+            print(f"Appending layer {layer_counter[0]} to infos_GPU, type = {layer_info['layer_type']}")
+            # ### test
+            real_minus_lower = y_lower - y
+            real_minus_upper = y - y_upper
+            real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+            real_outside = torch.clamp(real_outside, min=0.0)  # 只保留超出的部分
+            print("Output range width: ", (y_upper - y_lower).max().item())
+            print("Real GPU output range error: ", real_outside.max().item())
+
+        # CPU模式下，只有输出上下界有价值
+        if infos_CPU is not None:
+            infos_CPU.append(layer_info)
+            print(f"Appending layer {layer_counter[0]} to infos_CPU, type = {layer_info['layer_type']}")
+            # 确保都在CPU上做比较
+                    # output_normalized_cpu = output_normalized.detach().cpu()
+                    # x_cpu = x.detach().cpu()
+                    # diff = (output_normalized_cpu - x_cpu).abs().max().item()
+                    # print(f"Manual norm vs. torch norm diff: {diff}")
+        
+        if layer_counter is not None:
+            layer_counter[0] = layer_counter[0] + 1
+        
         return y, y_lower, y_upper
 
 class MLP(nn.Module):
@@ -263,60 +627,240 @@ class MLP(nn.Module):
 
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x, x_lower=None, x_upper=None, operator_noise=0): 
-        if x_lower is None:
+    def forward(self, x, x_error=None, operator_noise=0, infos_GPU=None, infos_CPU=None, layer_counter=None): 
+        if x_error is None:
             x_lower = x.clone()
-        if x_upper is None:
             x_upper = x.clone()
-       
-        with torch.no_grad():
-            mask_positive = self.c_fc.weight.data >= 0
-            mask_negative = self.c_fc.weight.data < 0
-            c_fc_negative = self.c_fc.weight.data.clone()
-            c_fc_negative[mask_positive] = 0
-            self.c_fc_negative.weight = nn.Parameter(c_fc_negative)
-            c_fc_positive = self.c_fc.weight.data.clone()
-            c_fc_positive[mask_negative] = 0
-            self.c_fc_positive.weight = nn.Parameter(c_fc_positive)
-
-        x = self.c_fc(x)
-        with torch.no_grad():
-            x_lower_negative = self.c_fc_negative(x_lower)
-            x_lower_positive = self.c_fc_positive(x_lower)
-            x_upper_negative = self.c_fc_negative(x_upper)
-            x_upper_positive = self.c_fc_positive(x_upper)
-
-            x_lower = x_lower_positive + x_upper_negative - operator_noise
-            x_upper = x_upper_positive + x_lower_negative + operator_noise
-
-        x = self.gelu(x)
-        with torch.no_grad():
-            x_lower = self.gelu(x_lower) - operator_noise
-            x_upper = self.gelu(x_upper) + operator_noise
+        else:
+            x_lower = x - x_error
+            x_upper = x + x_error
+        
+        if layer_counter is not None:
+            layer_info = {
+                'layer_num': layer_counter[0],
+                'layer_type': 'MLP',
+                'x': x,
+                'x_lower': x_lower,
+                'x_upper': x_upper,
+                'y': None,
+                'y_lower': None,
+                'y_upper': None,
+            }
+        else:
+            layer_info = {}
             
-            mask_negative = self.c_proj.weight.data >= 0
-            mask_positive = self.c_proj.weight.data < 0
-            c_proj_negative = self.c_proj.weight.data.clone()
-            c_proj_negative[mask_negative] = 0
-            self.c_proj_negative.weight = nn.Parameter(c_proj_negative)
-            c_proj_positive = self.c_proj.weight.data.clone()
-            c_proj_positive[mask_positive] = 0
-            self.c_proj_positive.weight = nn.Parameter(c_proj_positive)
+        if x.device != self.c_fc.weight.device:
+            x = x.to(self.c_fc.weight.device)
+        if x_lower.device != self.c_fc.weight.device:
+            x_lower = x_lower.to(self.c_fc.weight.device)
+        if x_upper.device != self.c_fc.weight.device:
+            x_upper = x_upper.to(self.c_fc.weight.device)
+       
+        
+        # 第一步
+        x_fc = self.c_fc(x)
+        
+        W = self.c_fc.weight
+        b = self.c_fc.bias
+        x_forward_fc = x @ W.T
+        if b is not None:
+            x_forward_fc += b
+        
+        if infos_GPU is not None and infos_CPU is None:
+            layer_info['GPU_inter_outputs'] = [x_fc.detach().clone()]
+            layer_info['x_forward_fc'] = x_forward_fc.detach().clone()
+            
+        if infos_CPU is not None:
+            x_fc_cpu = x_fc.detach().clone()
+            x_fc2_cpu = x_forward_fc.detach().clone()
+            layer = next((item for item in infos_GPU if item["layer_num"] == layer_counter[0]), None)
+            x_fc_gpu = layer['GPU_inter_outputs'][0].to('cpu')
+            print("---------MLP TEST---------- ")
+            print("CPU/NPU C_FC error: ", (x_fc_gpu - x_fc_cpu).abs().max().item())
+            x_fc_manual_gpu = layer['x_forward_fc'].to('cpu')
+            print("CPU/NPU FC_forward_manual error: ", (x_fc_manual_gpu - x_fc2_cpu).abs().max().item())
+        
+        # --- IBP for first Linear (c_fc) ---
+        with torch.no_grad():           
+            W = self.c_fc.weight
+            b = self.c_fc.bias
 
-        x = self.c_proj(x)
+            W_pos = torch.clamp(W, min=0)
+            W_neg = torch.clamp(W, max=0)
+
+            x_lower_fc = x_lower @ W_pos.T + x_upper @ W_neg.T - operator_noise
+            x_upper_fc = x_upper @ W_pos.T + x_lower @ W_neg.T + operator_noise
+
+            if b is not None:
+                x_lower_fc += b
+                x_upper_fc += b
+        
+        # Old version
+#         with torch.no_grad():
+#             mask_positive = self.c_fc.weight.data >= 0
+#             mask_negative = self.c_fc.weight.data < 0
+#             c_fc_negative = self.c_fc.weight.data.clone()
+#             c_fc_negative[mask_positive] = 0
+#             self.c_fc_negative.weight = nn.Parameter(c_fc_negative)
+#             c_fc_positive = self.c_fc.weight.data.clone()
+#             c_fc_positive[mask_negative] = 0
+#             self.c_fc_positive.weight = nn.Parameter(c_fc_positive)
+#         with torch.no_grad():
+#             x_lower_negative = self.c_fc_negative(x_lower)
+#             x_lower_positive = self.c_fc_positive(x_lower)
+#             x_upper_negative = self.c_fc_negative(x_upper)
+#             x_upper_positive = self.c_fc_positive(x_upper)
+
+#             x_lower = x_lower_positive + x_upper_negative - operator_noise
+#             x_upper = x_upper_positive + x_lower_negative + operator_noise
+
+        # 第二步：激活函数
+        x_gelu = self.gelu(x_fc)
+        
+        if infos_GPU is not None and infos_CPU is None:
+            layer_info['GPU_inter_outputs'].append(x_gelu.detach().clone())
+            
+        if infos_CPU is not None:
+            x_act_cpu = x_gelu.detach().clone()
+            layer = next((item for item in infos_GPU if item["layer_num"] == layer_counter[0]), None)
+            x_act_gpu = layer['GPU_inter_outputs'][1].to('cpu')
+            x_fc_gpu = layer['GPU_inter_outputs'][0].to('cpu')
+            x_gelu_2_cpu = self.gelu(x_fc_gpu)
+            print("CPU/NPU GELU ONLY error: ", (x_act_gpu - x_gelu_2_cpu).abs().max().item())
+            print("CPU/NPU GELU error: ", (x_act_gpu - x_act_cpu).abs().max().item())
+        
         with torch.no_grad():
-            x_lower_negative = self.c_proj_negative(x_lower)
-            x_lower_positive = self.c_proj_positive(x_lower)
-            x_upper_negative = self.c_proj_negative(x_upper)
-            x_upper_positive = self.c_proj_positive(x_upper)
+            # gelu分段单调临界点为-0.75246142，精确到小数点后8位
+            x_crit = -0.75246142
+            gelu_lower = self.gelu(x_lower_fc)
+            gelu_upper = self.gelu(x_upper_fc)
 
-            x_lower = x_lower_positive + x_upper_negative - operator_noise
-            x_upper = x_upper_positive + x_lower_negative + operator_noise
+            # 构造掩码，判断哪些位置包含临界点
+            cross_crit_mask = (x_lower_fc < x_crit) & (x_upper_fc > x_crit)
 
-        x = self.dropout(x)
+            # 默认情况：端点 min/max
+            min_val = torch.minimum(gelu_lower, gelu_upper)
+            max_val = torch.maximum(gelu_lower, gelu_upper)
+
+            # 临界点处的 gelu 值（是常数）
+            crit_val = self.gelu(torch.tensor(x_crit, device=x_lower_fc.device))
+
+            # 用 mask 替换下界中跨越临界点的那些位置
+            x_lower_act = torch.where(cross_crit_mask, crit_val, min_val)
+            x_upper_act = max_val
+
+            # 加入 operator_noise
+            x_lower_act = x_lower_act - operator_noise
+            x_upper_act = x_upper_act + operator_noise
+
+            # # IBP through GELU。单调，所以直接激活上下界。后续：GELU不是单调的，有问题，弃用
+            # x_lower_act = self.gelu(x_lower_fc) - operator_noise
+            # x_upper_act = self.gelu(x_upper_fc) + operator_noise
+            
+            
+
+        # old version
+#         with torch.no_grad():
+#             x_lower = self.gelu(x_lower) - operator_noise
+#             x_upper = self.gelu(x_upper) + operator_noise
+            
+#             mask_negative = self.c_proj.weight.data >= 0
+#             mask_positive = self.c_proj.weight.data < 0
+#             c_proj_negative = self.c_proj.weight.data.clone()
+#             c_proj_negative[mask_negative] = 0
+#             self.c_proj_negative.weight = nn.Parameter(c_proj_negative)
+#             c_proj_positive = self.c_proj.weight.data.clone()
+#             c_proj_positive[mask_positive] = 0
+#             self.c_proj_positive.weight = nn.Parameter(c_proj_positive)
+
+        # 第二步：线性变换
+        x_proj = self.c_proj(x_gelu)
+        
+        if infos_GPU is not None and infos_CPU is None:
+            layer_info['GPU_inter_outputs'].append(x_proj.detach().clone())
+            
+        if infos_CPU is not None:
+            x_proj_cpu = x_proj.detach().clone()
+            layer = next((item for item in infos_GPU if item["layer_num"] == layer_counter[0]), None)
+            x_proj_gpu = layer['GPU_inter_outputs'][2].to('cpu')
+            x_gelu_gpu = layer['GPU_inter_outputs'][1].to('cpu')
+            x_proj_2_cpu = self.c_proj(x_gelu_gpu)
+            print("CPU/NPU proj ONLY error: ", (x_proj_gpu - x_proj_2_cpu).abs().max().item())
+            print("CPU/NPU proj error: ", (x_proj_gpu - x_proj_cpu).abs().max().item())
+        
         with torch.no_grad():
-            x_lower = self.dropout(x_lower) - operator_noise
-            x_upper = self.dropout(x_upper) + operator_noise
+            # --- IBP for second Linear (c_proj) ---
+            W = self.c_proj.weight
+            b = self.c_proj.bias
+
+            W_pos = torch.clamp(W, min=0)
+            W_neg = torch.clamp(W, max=0)
+
+            x_lower_proj = x_lower_act @ W_pos.T + x_upper_act @ W_neg.T - operator_noise
+            x_upper_proj = x_upper_act @ W_pos.T + x_lower_act @ W_neg.T + operator_noise
+
+            if b is not None:
+                x_lower_proj += b
+                x_upper_proj += b
+
+        
+#         with torch.no_grad():
+#             x_lower_negative = self.c_proj_negative(x_lower)
+#             x_lower_positive = self.c_proj_positive(x_lower)
+#             x_upper_negative = self.c_proj_negative(x_upper)
+#             x_upper_positive = self.c_proj_positive(x_upper)
+
+#             x_lower = x_lower_positive + x_upper_negative - operator_noise
+#             x_upper = x_upper_positive + x_lower_negative + operator_noise
+
+        x = self.dropout(x_proj)
+        # eval推理模式下dropout为恒等变换，不考虑误差
+        # with torch.no_grad():
+        #     x_lower = self.dropout(x_lower) - operator_noise
+        #     x_upper = self.dropout(x_upper) + operator_noise
+        
+        # GPU/NPU模式下，只有输出值x有价值 old
+        # layer_info['y'] = x
+        # layer_info['y_lower'] = x_lower
+        # layer_info['y_upper'] = x_upper
+        
+        layer_info['y'] = x
+        layer_info['y_lower'] = x_lower_proj
+        layer_info['y_upper'] = x_upper_proj
+            
+        # GPU/NPU模式下，只有输出值y有价值
+        if infos_GPU is not None and infos_CPU is None:              
+            infos_GPU.append(layer_info)
+            print(f"Appending layer {layer_counter[0]} to infos_GPU, type = {layer_info['layer_type']}")
+            ### test
+            real_minus_lower = x_lower_proj - x
+            real_minus_upper = x - x_upper_proj
+            real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+            real_outside = torch.clamp(real_outside, min=0.0)  # 只保留超出的部分
+            print("Output range width: ", (x_upper_proj - x_lower_proj).max().item())
+            print("Real GPU output range error: ", real_outside.max().item())
+            # exit()
+
+        # CPU模式下，只有输出上下界有价值
+        if infos_CPU is not None:
+            infos_CPU.append(layer_info)
+            print("----------- MLP finishes. --------")
+            print(f"Appending layer {layer_counter[0]} to infos_CPU, type = {layer_info['layer_type']}")
+            # layer = next((item for item in infos_GPU if item["layer_num"] == layer_counter[0]), None)
+            # x_gpu = layer['x'].detach().to('cpu').clone()
+            # y_gpu = layer['y'].detach().to('cpu').clone()
+            # print("CPU/NPU input allignment error: ", (x_gpu - layer_info['x'].detach().to('cpu').clone()).abs().max().item())
+            # print("CPU/NPU output error: ", (y_gpu - layer_info['y']).abs().max().item())
+            # real_minus_lower = x_lower_proj - y_gpu
+            # real_minus_upper = y_gpu - x_upper_proj
+            # real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+            # real_outside = torch.clamp(real_outside, min=0.0)  # 只保留超出的部分
+            # print("Output range width: ", (x_upper_proj - x_lower_proj).max().item())
+            # print("NPU/GPU outside CPU range error: ", real_outside.max().item())
+            # print("-----------------")
+        
+        if layer_counter is not None:
+            layer_counter[0] = layer_counter[0] + 1
 
         return x, x_lower, x_upper
 
@@ -329,21 +873,154 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, x_lower=None, x_upper=None, operator_noise=0):
+    def forward(self, x, x_error=None, operator_noise=0, infos_GPU=None, infos_CPU=None, layer_counter=None):
+        if x_error is None:
+            x_lower = x.clone()
+            x_upper = x.clone()
+        else:
+            x_lower = x - x_error
+            x_upper = x + x_error  
+            
+        # layer_info = {
+        #     'layer_num': None,
+        #     'layer_type': 'Block',
+        #     'x': x,
+        #     'x_lower': x_lower,
+        #     'x_upper': x_upper,
+        #     'y': None,
+        #     'y_lower': None,
+        #     'y_upper': None,
+        # }
 
-        x, x_lower, x_upper = self.ln_1(x, x_lower, x_upper, operator_noise)
-        attn_x, attn_x_lower, attn_x_upper = self.attn(x, x_lower, x_upper, operator_noise)
+        if infos_CPU is not None:
+            # we need to first search the correct layer in GPU
+            layer = next((item for item in infos_GPU if item["layer_num"] == layer_counter[0]), None)
+            x, x_lower, x_upper = self.ln_1(layer['x'], x_error, operator_noise, infos_GPU, infos_CPU, layer_counter)
+            ## test
+            # y_real = layer['y'].detach().to('cpu').clone()
+            # y_pred = infos_CPU[-1]['y'].detach().to('cpu').clone()
+            # y_cpu_lower = infos_CPU[-1]['y_lower'].detach().to('cpu').clone()
+            # y_cpu_upper = infos_CPU[-1]['y_upper'].detach().to('cpu').clone()
+            # print("CPU/NPU output error: ", (y_real - y_pred).abs().max().item())
+            # real_minus_lower = y_cpu_lower - y_real
+            # real_minus_upper = y_real - y_cpu_upper
+            # real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+            # real_outside = torch.clamp(real_outside, min=0.0)  # 只保留超出的部分
+            # print("NPU outside CPU range error: ", real_outside.max().item())
+            # bound_width = (y_cpu_upper - y_cpu_lower).max().item()
+            # print("CPU Interval width max: ", bound_width)
+        else:
+            x, x_lower, x_upper = self.ln_1(x, x_error, operator_noise, infos_GPU, infos_CPU=None, layer_counter=layer_counter)
+        
+        if infos_CPU is not None:
+            # we need to first search the correct layer in GPU
+            layer = next((item for item in infos_GPU if item["layer_num"] == layer_counter[0]), None)
+            attn_x, attn_x_lower, attn_x_upper = self.attn(layer['x'], x_error, operator_noise, infos_GPU, infos_CPU, layer_counter)
+            ### test
+            # y_real = layer['y'].detach().to('cpu').clone()
+            # y_pred = infos_CPU[-1]['y'].detach().to('cpu').clone()
+            # y_cpu_lower = infos_CPU[-1]['y_lower'].detach().to('cpu').clone()
+            # y_cpu_upper = infos_CPU[-1]['y_upper'].detach().to('cpu').clone()
+            # print("CPU/NPU output error: ", (y_real - y_pred).abs().max().item())
+            # real_minus_lower = y_cpu_lower - y_real
+            # real_minus_upper = y_real - y_cpu_upper
+            # real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+            # real_outside = torch.clamp(real_outside, min=0.0)  # 只保留超出的部分
+            # print("NPU outside CPU range error: ", real_outside.max().item())
+            # bound_width = (y_cpu_upper - y_cpu_lower).max().item()
+            # print("CPU Interval width max: ", bound_width)
+        else:
+            attn_x, attn_x_lower, attn_x_upper = self.attn(x, x_error, operator_noise, infos_GPU, infos_CPU=None, layer_counter=layer_counter)
+        
+        if x.device != attn_x.device:
+            x = x.to(attn_x.device)
+        if x_lower.device != attn_x_lower.device:
+            x_lower = x_lower.to(attn_x_lower.device)
+        if x_upper.device != attn_x_upper.device:
+            x_upper = x_upper.to(attn_x_lower.device)
         x = x + attn_x
+        
         with torch.no_grad():
             x_lower = x_lower + attn_x_lower
             x_upper = x_upper + attn_x_upper
 
-        x, x_lower, x_upper = self.ln_2(x, x_lower, x_upper, operator_noise)
-        mlp_x, mlp_x_lower, mlp_x_upper = self.mlp(x, x_lower, x_upper, operator_noise)
+        if infos_CPU is not None:
+            # we need to first search the correct layer in GPU
+            layer = next((item for item in infos_GPU if item["layer_num"] == layer_counter[0]), None)
+            x, x_lower, x_upper = self.ln_2(layer['x'], x_error, operator_noise, infos_GPU, infos_CPU, layer_counter)
+            ## test
+            # y_real = layer['y'].detach().to('cpu').clone()
+            # y_pred = infos_CPU[-1]['y'].detach().to('cpu').clone()
+            # y_cpu_lower = infos_CPU[-1]['y_lower'].detach().to('cpu').clone()
+            # y_cpu_upper = infos_CPU[-1]['y_upper'].detach().to('cpu').clone()
+            # print("CPU/NPU output error: ", (y_real - y_pred).abs().max().item())
+            # real_minus_lower = y_cpu_lower - y_real
+            # real_minus_upper = y_real - y_cpu_upper
+            # real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+            # real_outside = torch.clamp(real_outside, min=0.0)  # 只保留超出的部分
+            # print("NPU outside range error: ", real_outside.max().item())
+            # bound_width = (y_cpu_upper - y_cpu_lower).max().item()
+            # print("CPU Interval width max: ", bound_width)
+        else:    
+            x, x_lower, x_upper = self.ln_2(x, x_error, operator_noise, infos_GPU, infos_CPU=None, layer_counter=layer_counter)
+            
+        if infos_CPU is not None:
+            # we need to first search the correct layer in GPU
+            layer = next((item for item in infos_GPU if item["layer_num"] == layer_counter[0]), None)
+            mlp_x, mlp_x_lower, mlp_x_upper = self.mlp(layer['x'], x_error, operator_noise, infos_GPU, infos_CPU, layer_counter)
+            # ## test
+            # y_real = layer['y'].detach().to('cpu').clone()
+            # y_pred = infos_CPU[-1]['y'].detach().to('cpu').clone()
+            # y_cpu_lower = infos_CPU[-1]['y_lower'].detach().to('cpu').clone()
+            # y_cpu_upper = infos_CPU[-1]['y_upper'].detach().to('cpu').clone()
+            # print("In Block-CPU/NPU output error: ", (y_real - y_pred).abs().max().item())
+            # real_minus_lower = y_cpu_lower - y_real
+            # real_minus_upper = y_real - y_cpu_upper
+            # real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+            # real_outside = torch.clamp(real_outside, min=0.0)  # 只保留超出的部分
+            # print("In Block-NPU outside range error: ", real_outside.max().item())
+            # bound_width = (y_cpu_upper - y_cpu_lower).max().item()
+            # print("In Block-CPU Interval width max: ", bound_width)
+            # exit()
+        else:
+            mlp_x, mlp_x_lower, mlp_x_upper = self.mlp(x, x_error, operator_noise, infos_GPU, infos_CPU=None, layer_counter=layer_counter)
+        
+        if x.device != mlp_x.device:
+            x = x.to(mlp_x.device)
         x = x + mlp_x
+
+        if x_lower.device != mlp_x_lower.device:
+            x_lower = x_lower.to(mlp_x_lower.device)
+        if x_upper.device != mlp_x_upper.device:
+            x_upper = x_upper.to(mlp_x_upper.device)
         with torch.no_grad():
             x_lower = x_lower + mlp_x_lower
             x_upper = x_upper + mlp_x_upper
+        
+#         layer_info['layer_num'] = layer_counter[0]
+#         layer_info['y'] = x
+#         layer_info['y_lower'] = x_lower
+#         layer_info['y_upper'] = x_upper
+            
+#         # GPU/NPU模式下，只有输出值y有价值
+#         if infos_GPU is not None and infos_CPU is None:     
+#             infos_GPU.append(layer_info)
+#             print(f"Appending layer {layer_counter[0]} to infos_GPU, type = {layer_info['layer_type']}")
+#             ### test
+#             # real_minus_lower = x_lower - x
+#             # real_minus_upper = x - x_upper
+#             # real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+#             # real_outside = torch.clamp(real_outside, min=0.0)  # 只保留超出的部分
+#             # print("Output range width: ", (x_upper - x_lower).max().item())
+#             # print("Real GPU output range error: ", real_outside.max().item())
+
+#         # CPU模式下，只有输出上下界有价值
+#         if infos_CPU is not None:
+#             infos_CPU.append(layer_info)
+#             print(f"Appending layer {layer_counter[0]} to infos_CPU, type = {layer_info['layer_type']}")
+            
+#         layer_counter[0] = layer_counter[0] + 1
+            
         return x, x_lower, x_upper
 
 @dataclass
@@ -408,13 +1085,8 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, input_error_lower=-1e-3, input_error_upper=1e-3, noising_input=False, noising_operator=False):
-        infos = {
-            'x': [],
-            'x_lower': [],
-            'x_upper': [],
-            'bounded': True,
-        }
+    def forward(self, idx, targets=None, robust_veri=None, input_error=1e-5, infos_GPU=None, noising_input=False, operator_noise=0):
+        infos_CPU = []
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -426,48 +1098,72 @@ class GPT(nn.Module):
         x = self.transformer.drop(tok_emb + pos_emb)
         if noising_input:
             x = x + (torch.rand_like(x).to(device) * (input_error_upper - input_error_lower) + input_error_lower)
-        operator_noise = 0
-        if noising_operator:
-            operator_noise = 1e-7
         with torch.no_grad():
-            x_lower = x + input_error_lower
-            x_upper = x + input_error_upper
-        # infos['x'].append(x)
-        # infos['x_lower'].append(x_lower)
-        # infos['x_upper'].append(x_upper)
-        # infos['bounded'] *= (((x >= x_lower) * (x <= x_upper)).sum() == x.view(-1).shape[0])
+            x_lower = x - input_error
+            x_upper = x + input_error
+        # record input
+        ######### test
+#         if infos_GPU is not None:
+#             diff = (x - infos_GPU['x'][0].cpu()).abs()
+#             print(f"Max diff after .to('cpu'): {diff.max().item():.2e}")
+#             print(f"Mean diff after .to('cpu'): {diff.mean().item():.2e}")
 
-        for block in self.transformer.h:
-            x, x_lower, x_upper = block(x, x_lower, x_upper, operator_noise)
-            infos['x'].append(x)
-            infos['x_lower'].append(x_lower)
-            infos['x_upper'].append(x_upper)
-            infos['bounded'] *= (((x >= x_lower) * (x <= x_upper)).sum() == x.view(-1).shape[0])
-            # infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
-            # infos['bounded'].append((x >= x_lower).all() and (x <= x_upper).all())
+#             # 额外：确认是否所有元素都完全一致
+#             all_close = torch.allclose(x, infos_GPU['x'][0].cpu(), atol=1e-7)
+#             print(f"All elements close within 1e-7? {'✅' if all_close else '❌'}")
+#             exit()
+        #########
+        
 
-        x, x_lower, x_upper = self.transformer.ln_f(x, x_lower, x_upper, operator_noise)
+        x_GPU = []
+        # robust_veri can be Off, CPU, GPU
+        if robust_veri == 'CPU' and infos_GPU is not None:
+            # get GPU x info
+            x_GPU = [layer['x'].detach().to("cpu") for layer in infos_GPU]
+        layer_counter = [0]
+        if infos_GPU is not None:
+            for block in self.transformer.h:
+                if robust_veri == 'CPU':
+                    if layer_counter[0] >= len(x_GPU):
+                        raise ValueError(f"layer_counter {layer_counter[0]} out of x_GPU range {len(x_GPU)}")
+                    x_GPU_input = x_GPU[layer_counter[0]]
+                    x, x_lower, x_upper = block(x_GPU_input, input_error, operator_noise, infos_GPU, infos_CPU, layer_counter)
+                else:
+                    x, x_lower, x_upper = block(x, input_error, operator_noise, infos_GPU, infos_CPU=None, layer_counter=layer_counter)
 
-        infos['x'].append(x)
-        infos['x_lower'].append(x_lower)
-        infos['x_upper'].append(x_upper)
-        infos['bounded'] *= (((x >= x_lower) * (x <= x_upper)).sum() == x.view(-1).shape[0])
-        # infos['bounded'] = infos['bounded'].detach().cpu().item()
-        # infos['bounded'].append(((x >= x_lower) * (x <= x_upper)).sum() / x.view(-1).shape[0])
-        # infos['bounded'].append((x >= x_lower).all() and (x <= x_upper).all())
+        if infos_GPU is not None:
+            if robust_veri == 'CPU':
+                x_GPU_input = x_GPU[layer_counter[0]]
+                y_real = infos_GPU[layer_counter[0]]['y'].detach().to('cpu').clone()
+                
+                x, x_lower, x_upper = self.transformer.ln_f(x_GPU_input, input_error, operator_noise, infos_GPU, infos_CPU, layer_counter)
+                
+                y_pred = infos_CPU[-1]['y'].detach().to('cpu').clone()
+                y_cpu_lower = infos_CPU[-1]['y_lower'].detach().to('cpu').clone()
+                y_cpu_upper = infos_CPU[-1]['y_upper'].detach().to('cpu').clone()
+                print("CPU/NPU output error: ", (y_real - y_pred).abs().max().item())
+                real_minus_lower = y_cpu_lower - y_real
+                real_minus_upper = y_real - y_cpu_upper
+                real_outside = torch.maximum(real_minus_lower, real_minus_upper)
+                real_outside = torch.clamp(real_outside, min=0.0)  # 只保留超出的部分
+                print("NPU outside range error: ", real_outside.max().item())
+                bound_width = (y_cpu_upper - y_cpu_lower).max().item()
+                print("CPU Interval width max: ", bound_width)
+            else:              
+                x, x_lower, x_upper = self.transformer.ln_f(x, input_error, operator_noise, infos_GPU, infos_CPU=None, layer_counter=layer_counter)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            logits += (torch.rand_like(logits).to(device) * (input_error_upper - input_error_lower) + input_error_lower)
+            logits += (torch.rand_like(logits).to(device) * 2 * input_error - input_error)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            logits += (torch.rand_like(logits).to(device) * (input_error_upper - input_error_lower) + input_error_lower)
+            logits += (torch.rand_like(logits).to(device) * 2 * input_error - input_error)
             loss = None
 
-        return logits, loss, infos
+        return logits, loss, infos_CPU
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary

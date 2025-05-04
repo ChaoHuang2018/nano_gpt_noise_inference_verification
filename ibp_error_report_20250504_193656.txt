@@ -1,0 +1,26 @@
+IBP Error Report (Multiple Samples)
+Generated at: 20250504_193656
+============================================================
+Noise Info:
+  input_error: 0
+  operator_noise: 1e-07
+  batch_size: 64
+------------------------------------------------------------
+Layer Type     : LayerNorm
+  Total Count  : 832
+  Error Count  : 0
+  Error Rate   : 0.0000
+------------------------------------------------------------
+Layer Type     : SelfAttention
+  Total Count  : 384
+  Error Count  : 0
+  Error Rate   : 0.0000
+------------------------------------------------------------
+Layer Type     : MLP
+  Total Count  : 384
+  Error Count  : 384
+  Error Rate   : 1.0000
+  Max Outside Error  : 4.132092e-05
+  True CPU/GPU Error : 4.248321e-05
+  Location (Sample #23, Layer #3)
+------------------------------------------------------------
